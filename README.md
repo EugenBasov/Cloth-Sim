@@ -1,1 +1,1 @@
-![cloth behavior example](illustration.png)
+![cloth behavior example](illustration.PNG)
