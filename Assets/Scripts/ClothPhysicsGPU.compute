@@ -1,0 +1,188 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel preSolve
+#pragma kernel solve
+#pragma kernel postSolve
+#pragma use_dxc
+#pragma target 6.6
+
+// HLSL has no interlocked add float for floats. So I made it in old-fascinated way.
+#define InterlockedAddFloat(var, value) {\
+    uint currentVal = var;\
+    uint originalVal;\
+    \
+    [allow_uav_condition]\
+    do\
+    {\
+        originalVal = currentVal;\
+        \
+        float floatVal = asfloat(originalVal);\
+        float newVal = floatVal + value;\
+        uint intNewVal = asuint(newVal);\
+        \
+        InterlockedCompareExchange(var, originalVal, intNewVal, currentVal);\
+        \
+    } while (currentVal != originalVal);\
+}
+
+
+#define InterlockedAddFloat3(vec, value) {\
+    InterlockedAddFloat(vec.x, value.x);\
+    InterlockedAddFloat(vec.y, value.y);\
+    InterlockedAddFloat(vec.z, value.z);\
+}
+
+// Returns the push vector if the particle is inside the capsule
+float3 IntersectPointCapsule(float3 p, float3 a, float3 b, float r)
+{
+    float3 ab = b - a;
+    if (length(ab) < 1e-6)
+        return (length(p - a) >= r) ? 0 : ((normalize(p - a) * r) - (p - a));
+    float3 ap = p - a;
+
+    float t = dot(ap, ab) / dot(ab, ab);
+
+    t = saturate(t);
+
+    float3 closestPoint = a + ab * t;
+
+    float3 distVec = p - closestPoint;
+    if (length(distVec) >= r)
+    {
+        return float3(0,0,0);
+    }
+    return (normalize(distVec) * r) - distVec;
+    return (length(distVec) >= r) ? 0 : ((normalize(distVec) * r) - distVec);
+}
+
+struct ParticleData
+{
+    float mass;
+    uint3 position;
+    uint3 deltaPosition;
+    float3 prevPosition;
+    float3 velocity;
+    int constraintCount;
+};
+struct SpringData
+{
+    int p1;
+    int p2;
+    float restLength;
+    float lambda;
+};
+struct Capsule
+{
+    float3 start;
+    float3 end;
+    float radius;
+};
+
+RWStructuredBuffer<ParticleData> particles;
+RWStructuredBuffer<SpringData> springs;
+RWStructuredBuffer<Capsule> capsules;
+int springs_n;
+int particles_n;
+int spheres_n;
+int capsules_n;
+int iterations;
+float elasticity;
+float dumpingFactor;
+float stretchingFactor;
+float stiffness;
+float deltaTime;
+float compliance;
+
+[numthreads(64, 1, 1)]
+void preSolve(uint id : SV_DispatchThreadID)
+{
+    if (id.x >= springs_n)
+        return;
+    // Slightly decrease Langrange multiplier 
+    springs[id.x].lambda = springs[id.x].lambda / 1.01;
+}
+// Constraints solving
+[numthreads(64, 1, 1)]
+void solve(uint id : SV_DispatchThreadID)
+{
+    if (id.x >= springs_n)
+        return;
+    float alpha = compliance / (deltaTime * deltaTime);
+    int p1i = springs[id.x].p1;
+    int p2i = springs[id.x].p2;
+    float w0 = 1.0 / particles[p1i].mass;
+    float w1 = 1.0 / particles[p2i].mass;
+    float w = w0 + w1;
+    if (w == 0.0)
+        return;
+
+    float3 posDiff = asfloat(particles[p1i].position) - asfloat(particles[p2i].position);
+    float dist = length(posDiff);
+    posDiff = normalize(posDiff);
+    if (dist == 0.0)
+        return;
+    float C = dist - springs[id.x].restLength;
+    float deltaLambda = (-C - alpha * springs[id.x].lambda) / (w + alpha);
+    springs[id.x].lambda += deltaLambda;
+    InterlockedAddFloat3(particles[p1i].deltaPosition, (posDiff * deltaLambda * w0))
+    InterlockedAddFloat3(particles[p2i].deltaPosition, -(posDiff * deltaLambda * w1))
+    InterlockedAdd(particles[p1i].constraintCount, 1);
+    InterlockedAdd(particles[p2i].constraintCount, 1);
+    
+}
+
+// Push particles out of capsules
+void collisionSolve(int pi)
+{
+    for (int i = 0; i < capsules_n; i++)
+    {
+        float thickness = 0.01;
+        float3 pushDirection = IntersectPointCapsule(asfloat(particles[pi].position),
+                               capsules[i].start, capsules[i].end, capsules[i].radius + thickness);
+        float dist = length(pushDirection);
+        if (dist < 1e-6)
+            continue;
+        InterlockedAddFloat3(particles[pi].position, pushDirection)
+        
+        // Hardcoded friction coeficient
+        float friction = 0.5;
+        float3 delta = asfloat(particles[pi].position) - asfloat(particles[pi].prevPosition);
+        float3 normal = normalize(pushDirection);
+        float distNormal = dot(delta, normal);
+        float3 deltaTangent = delta - (distNormal * normal);
+        float slipLen = length(deltaTangent);
+        if (slipLen < 0.00001f)
+        {
+            continue;
+        }
+        float frictionLimit = length(pushDirection) * friction;
+
+        float3 correctionVec = -(deltaTangent / slipLen) * min(slipLen, frictionLimit);
+
+        InterlockedAddFloat3(particles[pi].position, correctionVec)
+    }
+}
+
+[numthreads(64, 1, 1)]
+void postSolve(uint id : SV_DispatchThreadID)
+{
+    if (id.x >= particles_n)
+        return;
+
+    // Add deltaPositions to positions (Jacobi Solver)
+    InterlockedAddFloat3(particles[id.x].position, (asfloat(particles[id.x].deltaPosition) / (particles[id.x].constraintCount / 2.5)))
+    particles[id.x].constraintCount = 1;
+    particles[id.x].deltaPosition = asuint(0.0);
+    // Update velocities
+    particles[id.x].velocity = (asfloat(particles[id.x].position) - particles[id.x].prevPosition) * (1.0 / deltaTime);
+    // Apply external forces (gravity)
+    particles[id.x].velocity += float3(0, -0.98 * 10.0, 0) * deltaTime;
+    // Air resistance forces simulation
+    particles[id.x].velocity *= (1.0 - (0.3 * deltaTime));
+    particles[id.x].prevPosition = asfloat(particles[id.x].position);
+    // Apply velocities to particles ("prediction")
+    InterlockedAddFloat3(particles[id.x].position, (particles[id.x].velocity * deltaTime))
+    
+    collisionSolve(id.x);
+    
+}
+
